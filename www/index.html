@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- Lets "Add to Home Screen" run this without Safari's chrome, which on a
+     1024x768 screen is a meaningful amount of the picture. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Photo Frame</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    cursor: none;
+  }
+  /* Two stacked layers that cross-fade. background-size is used rather than
+     object-fit on an <img>, because object-fit did not arrive until Safari 10
+     and this page has to run unmodified on Safari 9. */
+  .layer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background-position: center center;
+    background-repeat: no-repeat;
+    background-size: contain;
+    opacity: 0;
+    -webkit-transition: opacity 1.2s ease-in-out;
+    transition: opacity 1.2s ease-in-out;
+  }
+  /* The caption lives inside its layer, so it fades in and out with its own
+     photo rather than lagging behind during the cross-fade. left/bottom are
+     set from JS to match the letterboxed image box, not the viewport. */
+  .caption {
+    position: absolute;
+    left: 0; bottom: 0;
+    padding: 14px 18px;
+    color: #fff;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    /* No scrim behind the text: a hard shadow keeps it legible over a bright
+       sky without putting a grey box over the corner of every photo. */
+    text-shadow: 0 1px 2px rgba(0,0,0,0.95), 0 0 10px rgba(0,0,0,0.75);
+    -webkit-box-sizing: border-box;
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+  .caption .place {
+    font-size: 25px;
+    line-height: 1.25;
+    font-weight: 500;
+  }
+  .caption .when {
+    font-size: 35px;
+    line-height: 1.3;
+    opacity: 0.82;
+  }
+  #msg {
+    position: absolute;
+    top: 50%; left: 0;
+    width: 100%;
+    margin-top: -0.7em;
+    text-align: center;
+    color: #666;
+    font: 16px -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+</style>
+</head>
+<body>
+
+<div id="a" class="layer"><div class="caption"><div class="place"></div><div class="when"></div></div></div>
+<div id="b" class="layer"><div class="caption"><div class="place"></div><div class="when"></div></div></div>
+<div id="msg">Loading photos&hellip;</div>
+
+<script>
+/* Deliberately ES5. No arrow functions, no let/const, no template literals,
+   no fetch, no Promise -- none of which exist in the iOS 9 JavaScript engine.
+   Do not "modernise" this file. */
+(function () {
+  "use strict";
+
+  var MANIFEST_REFRESH = 15 * 60 * 1000;  // re-read photos.json every 15 min
+  var RETRY_DELAY      = 30 * 1000;       // when there is nothing to show yet
+
+  var layers = [document.getElementById("a"), document.getElementById("b")];
+  var msg    = document.getElementById("msg");
+  var front  = 0;
+
+  /* Natural pixel dimensions of whatever each layer is currently showing,
+     kept so the caption can be repositioned on rotation without reloading. */
+  var dims = [null, null];
+
+  var photos   = [];
+  var queue    = [];
+  var interval = 30000;
+  var timer    = null;
+  var failures = 0;
+
+  function setMessage(text) {
+    msg.style.display = text ? "block" : "none";
+    if (text) { msg.innerHTML = text; }
+  }
+
+  /* Work out where the image actually lands inside the viewport.
+
+     background-size: contain letterboxes the photo, so a portrait picture on
+     a landscape screen leaves black bars either side. Pinning the caption to
+     the viewport corner would drop it onto the bar; this pins it to the
+     corner of the picture itself. */
+  function placeCaption(layer, natural) {
+    var caption = layer.getElementsByTagName("div")[0];
+    if (!natural) { return; }
+
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var scale = Math.min(vw / natural.w, vh / natural.h);
+    var w = natural.w * scale;
+    var h = natural.h * scale;
+
+    caption.style.left = Math.round((vw - w) / 2) + "px";
+    caption.style.bottom = Math.round((vh - h) / 2) + "px";
+    caption.style.maxWidth = Math.round(w) + "px";
+  }
+
+  function fillCaption(layer, photo) {
+    var caption = layer.getElementsByTagName("div")[0];
+    var place = caption.getElementsByTagName("div")[0];
+    var when  = caption.getElementsByTagName("div")[1];
+
+    place.innerHTML = "";
+    when.innerHTML = "";
+    place.appendChild(document.createTextNode(photo.place || ""));
+    when.appendChild(document.createTextNode(photo.when || ""));
+
+    place.style.display = photo.place ? "block" : "none";
+    when.style.display = photo.when ? "block" : "none";
+    caption.style.display = (photo.place || photo.when) ? "block" : "none";
+  }
+
+  /* Fisher-Yates over a copy of the list. Drawing from a shuffled queue rather
+     than calling Math.random() each time means every photo is shown once
+     before any repeats, which looks far less broken than true randomness. */
+  function refill() {
+    queue = photos.slice();
+    for (var i = queue.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var tmp = queue[i];
+      queue[i] = queue[j];
+      queue[j] = tmp;
+    }
+    /* Avoid the seam where the last photo of one pass is also the first of
+       the next. */
+    if (queue.length > 1 &&
+        layers[front].getAttribute("data-src") === queue[queue.length - 1].src) {
+      queue.unshift(queue.pop());
+    }
+  }
+
+  function show(photo, natural) {
+    var back = 1 - front;
+
+    layers[back].style.backgroundImage = 'url("' + photo.src + '")';
+    layers[back].setAttribute("data-src", photo.src);
+    dims[back] = natural;
+
+    fillCaption(layers[back], photo);
+    placeCaption(layers[back], natural);
+
+    layers[back].style.opacity = "1";
+    layers[front].style.opacity = "0";
+    front = back;
+    setMessage("");
+  }
+
+  function next() {
+    if (!photos.length) {
+      setMessage("No favourites found.<br>Star some photos in Nextcloud.");
+      schedule(RETRY_DELAY);
+      return;
+    }
+    if (!queue.length) { refill(); }
+
+    var photo = queue.pop();
+
+    /* Decode the image before swapping it in, so the cross-fade never reveals
+       a half-painted picture -- and so naturalWidth/Height are known, which
+       the caption positioning needs. */
+    var img = new Image();
+    img.onload = function () {
+      failures = 0;
+      show(photo, { w: img.naturalWidth, h: img.naturalHeight });
+      schedule(interval);
+    };
+    img.onerror = function () {
+      /* A photo that vanished between syncs. Skip it, but do not spin
+         forever if the whole directory has gone. */
+      failures++;
+      if (failures > photos.length) {
+        failures = 0;
+        setMessage("Cannot load photos.");
+        schedule(RETRY_DELAY);
+      } else {
+        next();
+      }
+    };
+    img.src = photo.src;
+  }
+
+  function schedule(ms) {
+    if (timer) { clearTimeout(timer); }
+    timer = setTimeout(next, ms);
+  }
+
+  function loadManifest(then) {
+    var xhr = new XMLHttpRequest();
+    /* Cache-buster: iOS 9 caches XHR responses more eagerly than you expect. */
+    xhr.open("GET", "photos.json?t=" + (new Date()).getTime(), true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      if (xhr.status === 200) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          if (data && data.photos) {
+            photos = data.photos;
+            queue = [];
+            if (data.interval) { interval = data.interval * 1000; }
+          }
+        } catch (e) { /* keep whatever we already had */ }
+      }
+      if (then) { then(); }
+    };
+    xhr.send();
+  }
+
+  /* Rotating the iPad changes the letterbox geometry, so the captions have to
+     move with it. orientationchange fires before the new dimensions settle,
+     hence the short delay. */
+  function reposition() {
+    placeCaption(layers[0], dims[0]);
+    placeCaption(layers[1], dims[1]);
+  }
+  window.addEventListener("resize", reposition, false);
+  window.addEventListener("orientationchange", function () {
+    setTimeout(reposition, 350);
+  }, false);
+
+  /* Tap anywhere to skip ahead. */
+  document.addEventListener("click", function () {
+    next();
+  }, false);
+
+  loadManifest(next);
+  setInterval(function () { loadManifest(null); }, MANIFEST_REFRESH);
+}());
+</script>
+
+</body>
+</html>

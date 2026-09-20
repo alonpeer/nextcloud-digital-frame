@@ -1,0 +1,36 @@
+[Unit]
+Description=Nextcloud favourites photo frame
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ---- EDIT: must match the owner of /opt/photo-frame -----------------------
+User=pi
+Group=pi
+# --------------------------------------------------------------------------
+
+# Credentials live here rather than in this file, because unit files are
+# world-readable by default and an app password is not.
+EnvironmentFile=/etc/photo-frame.env
+
+WorkingDirectory=/opt/photo-frame
+ExecStart=/usr/bin/python3 /opt/photo-frame/photoframe.py
+
+Restart=always
+RestartSec=10
+# A photo frame that gives up after five failed starts is a black screen you
+# have to notice and fix by hand. Keep retrying instead.
+StartLimitIntervalSec=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+# ProtectSystem=full leaves /usr, /boot and /etc read-only but still allows
+# writes under /opt, which is where the synced photos land.
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
