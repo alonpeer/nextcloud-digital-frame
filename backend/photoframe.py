@@ -76,6 +76,11 @@ GEOCODE_LANG = env("GEOCODE_LANG", "en")
 # touch before blocking you. Put a real one here if you geocode a lot.
 GEOCODE_AGENT = env("GEOCODE_AGENT", "nextcloud-photo-frame/1.0")
 
+# Quiet hours, as HH:MM. Validated here but evaluated in the browser against
+# the iPad's own clock -- see quiet_window() for why.
+QUIET_START = env("QUIET_START", "")
+QUIET_END = env("QUIET_END", "")
+
 PORT = env("PORT", 8000, int)
 BIND = env("BIND", "0.0.0.0")
 
@@ -116,6 +121,54 @@ for _i, _name in enumerate(
     MONTH_LOOKUP.setdefault(_name, _i)
 
 log = logging.getLogger("photoframe")
+
+
+# ------------------------------------------------------------ quiet hours
+
+def parse_hhmm(value):
+    """'23:00' -> 1380 minutes past midnight, or None if unusable."""
+    if not value:
+        return None
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", value)
+    if not match:
+        return None
+    hours, minutes = int(match.group(1)), int(match.group(2))
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        return None
+    return hours * 60 + minutes
+
+
+def quiet_window():
+    """
+    Validate QUIET_START/QUIET_END into {"start": "23:00", "end": "07:00"} for
+    the manifest, or None when quiet hours are off or misconfigured.
+    """
+    if not QUIET_START and not QUIET_END:
+        return None
+
+    start = parse_hhmm(QUIET_START)
+    end = parse_hhmm(QUIET_END)
+
+    if start is None or end is None:
+        log.warning(
+            "ignoring quiet hours: QUIET_START=%r QUIET_END=%r "
+            "-- both must be HH:MM in 24-hour form",
+            QUIET_START, QUIET_END,
+        )
+        return None
+
+    if start == end:
+        # Ambiguous: could mean "never" or "always". Refuse rather than guess.
+        log.warning("ignoring quiet hours: start and end are identical (%s)", QUIET_START)
+        return None
+
+    return {
+        "start": "%02d:%02d" % (start // 60, start % 60),
+        "end": "%02d:%02d" % (end // 60, end % 60),
+    }
+
+
+QUIET = quiet_window()
 
 
 # ------------------------------------------------------------------ config
@@ -634,6 +687,7 @@ def sync_once():
         MANIFEST_PATH,
         {
             "interval": PHOTO_INTERVAL,
+            "quiet": QUIET,
             "updated": int(time.time()),
             "photos": photos,
         },
@@ -696,10 +750,18 @@ def main():
         log.warning("pillow-heif not installed -- .heic favourites will be skipped")
     if not GEOCODE:
         log.info("reverse geocoding disabled -- captions will show dates only")
+    if QUIET:
+        log.info(
+            "quiet hours: %s to %s, judged by the tablet's own clock",
+            QUIET["start"], QUIET["end"],
+        )
 
     os.makedirs(PHOTO_DIR, exist_ok=True)
     if not os.path.exists(MANIFEST_PATH):
-        save_json(MANIFEST_PATH, {"interval": PHOTO_INTERVAL, "photos": []})
+        save_json(
+            MANIFEST_PATH,
+            {"interval": PHOTO_INTERVAL, "quiet": QUIET, "photos": []},
+        )
 
     threading.Thread(target=sync_loop, daemon=True).start()
 

@@ -82,6 +82,11 @@
 
   var MANIFEST_REFRESH = 15 * 60 * 1000;  // re-read photos.json every 15 min
   var RETRY_DELAY      = 30 * 1000;       // when there is nothing to show yet
+  var QUIET_CHECK      = 30 * 1000;       // how often to test the clock
+
+  /* Quiet hours are checked on their own timer rather than inside next(),
+     because PHOTO_INTERVAL can be an hour. Waiting for the next photo change
+     to notice bedtime would leave the screen lit long past it. */
 
   var layers = [document.getElementById("a"), document.getElementById("b")];
   var msg    = document.getElementById("msg");
@@ -95,6 +100,8 @@
   var queue    = [];
   var interval = 30000;
   var timer    = null;
+  var quiet    = null;   // {start, end} in minutes past midnight, or null
+  var sleeping = false;
   var failures = 0;
 
   function setMessage(text) {
@@ -138,6 +145,57 @@
     caption.style.display = (photo.place || photo.when) ? "block" : "none";
   }
 
+  function toMinutes(hhmm) {
+    var m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
+    if (!m) { return null; }
+    var h = parseInt(m[1], 10);
+    var mi = parseInt(m[2], 10);
+    if (h > 23 || mi > 59) { return null; }
+    return h * 60 + mi;
+  }
+
+  function parseQuiet(q) {
+    if (!q || !q.start || !q.end) { return null; }
+    var s = toMinutes(q.start);
+    var e = toMinutes(q.end);
+    if (s === null || e === null || s === e) { return null; }
+    return { start: s, end: e };
+  }
+
+  /* Compared against the device's local clock, so it follows whatever timezone
+     and DST the device is set to. The window may wrap past midnight, which is
+     the normal case for a bedtime -- hence the two branches. */
+  function isQuiet() {
+    if (!quiet) { return false; }
+    var now = new Date();
+    var mins = now.getHours() * 60 + now.getMinutes();
+    if (quiet.start < quiet.end) {
+      return mins >= quiet.start && mins < quiet.end;   // within one day
+    }
+    return mins >= quiet.start || mins < quiet.end;     // crosses midnight
+  }
+
+  function goDark() {
+    layers[0].style.opacity = "0";
+    layers[1].style.opacity = "0";
+    setMessage("");
+  }
+
+  /* Runs every QUIET_CHECK and on every manifest reload, so a change to
+     QUIET_START/QUIET_END on the Pi takes effect within 15 minutes without
+     touching the iPad. */
+  function checkQuiet() {
+    var night = isQuiet();
+    if (night && !sleeping) {
+      sleeping = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      goDark();
+    } else if (!night && sleeping) {
+      sleeping = false;
+      next();
+    }
+  }
+
   /* Fisher-Yates over a copy of the list. Drawing from a shuffled queue rather
      than calling Math.random() each time means every photo is shown once
      before any repeats, which looks far less broken than true randomness. */
@@ -174,6 +232,7 @@
   }
 
   function next() {
+    if (sleeping) { return; }
     if (!photos.length) {
       setMessage("No favourites found.<br>Star some photos in Nextcloud.");
       schedule(RETRY_DELAY);
@@ -188,6 +247,8 @@
        the caption positioning needs. */
     var img = new Image();
     img.onload = function () {
+      /* Bedtime may have arrived while this image was decoding. */
+      if (sleeping) { return; }
       failures = 0;
       show(photo, { w: img.naturalWidth, h: img.naturalHeight });
       schedule(interval);
@@ -225,6 +286,7 @@
             photos = data.photos;
             queue = [];
             if (data.interval) { interval = data.interval * 1000; }
+            quiet = parseQuiet(data.quiet);
           }
         } catch (e) { /* keep whatever we already had */ }
       }
@@ -247,11 +309,18 @@
 
   /* Tap anywhere to skip ahead. */
   document.addEventListener("click", function () {
+    /* Deliberately inert during quiet hours: a stray touch at 3am should not
+       light the room. Delete this line if you want tap-to-wake. */
+    if (sleeping) { return; }
     next();
   }, false);
 
-  loadManifest(next);
-  setInterval(function () { loadManifest(null); }, MANIFEST_REFRESH);
+  loadManifest(function () {
+    checkQuiet();
+    if (!sleeping) { next(); }
+  });
+  setInterval(checkQuiet, QUIET_CHECK);
+  setInterval(function () { loadManifest(checkQuiet); }, MANIFEST_REFRESH);
 }());
 </script>
 
